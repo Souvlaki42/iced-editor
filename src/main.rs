@@ -2,175 +2,201 @@ use iced::highlighter::{self, Highlighter};
 use iced::widget::{
     button, column, container, horizontal_space, pick_list, row, text, text_editor, tooltip,
 };
-use iced::{
-    executor, keyboard, theme, Application, Command, Element, Font, Length, Settings, Subscription,
-    Theme,
-};
+use iced::Alignment::Center;
+use iced::Length::Fill;
+use iced::{keyboard, Element, Font, Subscription, Task, Theme};
 
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::{ffi, io};
 
 fn main() -> iced::Result {
-    Editor::run(Settings {
-        default_font: Font::MONOSPACE,
-        fonts: vec![include_bytes!("../fonts/editor-icons.ttf")
-            .as_slice()
-            .into()],
-        ..Settings::default()
-    })
+    iced::application("Editor - Iced", Editor::update, Editor::view)
+        .subscription(Editor::subscription)
+        .theme(Editor::theme)
+        .font(include_bytes!("../fonts/icons.ttf").as_slice())
+        .default_font(Font::MONOSPACE)
+        .run_with(Editor::new)
 }
 
 struct Editor {
-    path: Option<PathBuf>,
+    file: Option<PathBuf>,
     content: text_editor::Content,
-    error: Option<Error>,
     theme: highlighter::Theme,
+    error: Option<Error>,
+    is_loading: bool,
     is_dirty: bool,
 }
 
 #[derive(Debug, Clone)]
 enum Message {
-    Edit(text_editor::Action),
-    FileOpened(Result<(PathBuf, Arc<String>), Error>),
-    FileSaved(Result<PathBuf, Error>),
+    ActionPerformed(text_editor::Action),
     ThemeSelected(highlighter::Theme),
-    Open,
-    New,
-    Save,
+    NewFile,
+    OpenFile,
+    FileOpened(Result<(PathBuf, Arc<String>), Error>),
+    SaveFile,
+    FileSaved(Result<PathBuf, Error>),
 }
 
-impl Application for Editor {
-    type Message = Message;
-    type Theme = Theme;
-    type Executor = executor::Default;
-    type Flags = ();
-
-    fn new(_flags: Self::Flags) -> (Self, Command<Message>) {
+impl Editor {
+    fn new() -> (Self, Task<Message>) {
         (
             Self {
-                path: None,
+                file: None,
                 content: text_editor::Content::new(),
-                error: None,
                 theme: highlighter::Theme::SolarizedDark,
-                is_dirty: true,
+                error: None,
+                is_loading: false,
+                is_dirty: false,
             },
-            Command::perform(load_file(default_file()), Message::FileOpened),
+            Task::none(),
         )
     }
 
-    fn title(&self) -> String {
-        String::from("A cool editor!")
-    }
-
-    fn update(&mut self, message: Message) -> Command<Message> {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Edit(action) => {
+            Message::ActionPerformed(action) => {
                 self.is_dirty = self.is_dirty || action.is_edit();
                 self.error = None;
-                self.content.edit(action);
-                Command::none()
-            }
-            Message::New => {
-                self.path = None;
-                self.content = text_editor::Content::new();
-                self.is_dirty = true;
-                Command::none()
-            }
-            Message::Open => Command::perform(pick_file(), Message::FileOpened),
-            Message::Save => {
-                let text = self.content.text();
-                Command::perform(save_file(self.path.clone(), text), Message::FileSaved)
-            }
-            Message::FileOpened(Ok((path, content))) => {
-                self.path = Some(path);
-                self.content = text_editor::Content::with(&content);
-                self.is_dirty = false;
-                Command::none()
-            }
-            Message::FileOpened(Err(error)) => {
-                self.error = Some(error);
-                Command::none()
-            }
-            Message::FileSaved(Ok(path)) => {
-                self.path = Some(path);
-                self.is_dirty = false;
-                Command::none()
-            }
-            Message::FileSaved(Err(error)) => {
-                self.error = Some(error);
-                Command::none()
+                self.content.perform(action);
+                Task::none()
             }
             Message::ThemeSelected(theme) => {
                 self.theme = theme;
-                Command::none()
+                Task::none()
+            }
+            Message::NewFile => {
+                if !self.is_loading {
+                    self.file = None;
+                    self.content = text_editor::Content::new();
+                }
+                Task::none()
+            }
+            Message::OpenFile => {
+                if self.is_loading {
+                    Task::none()
+                } else {
+                    self.is_loading = true;
+                    Task::perform(open_file(), Message::FileOpened)
+                }
+            }
+            Message::FileOpened(result) => {
+                self.is_loading = false;
+                self.is_dirty = false;
+
+                if let Ok((path, contents)) = result {
+                    self.file = Some(path);
+                    self.content = text_editor::Content::with_text(&contents);
+                } else if let Err(error) = result {
+                    self.error = Some(error);
+                }
+
+                Task::none()
+            }
+            Message::SaveFile => {
+                if self.is_loading {
+                    Task::none()
+                } else {
+                    self.is_loading = true;
+                    Task::perform(
+                        save_file(self.file.clone(), self.content.text()),
+                        Message::FileSaved,
+                    )
+                }
+            }
+            Message::FileSaved(result) => {
+                self.is_loading = false;
+                if let Ok(path) = result {
+                    self.file = Some(path);
+                    self.is_dirty = false;
+                } else if let Err(error) = result {
+                    self.error = Some(error);
+                }
+
+                Task::none()
             }
         }
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        keyboard::on_key_press(|key_code, modifiers| match key_code {
-            keyboard::KeyCode::S if modifiers.command() => Some(Message::Save),
-            keyboard::KeyCode::N if modifiers.command() => Some(Message::New),
-            keyboard::KeyCode::O if modifiers.command() => Some(Message::Open),
+        keyboard::on_key_press(|key, modifiers| match key.as_ref() {
+            keyboard::Key::Character("s") if modifiers.command() => Some(Message::SaveFile),
+            keyboard::Key::Character("n") if modifiers.command() => Some(Message::NewFile),
+            keyboard::Key::Character("o") if modifiers.command() => Some(Message::OpenFile),
             _ => None,
         })
     }
-
-    fn view(&self) -> Element<'_, Message> {
+    fn view(&self) -> Element<Message> {
         let controls = row![
-            action(new_icon(), "New file", Some(Message::New)),
-            action(open_icon(), "Open file", Some(Message::Open)),
+            action(icon('\u{E800}'), "New file", Some(Message::NewFile)),
             action(
-                save_icon(),
-                "Save file",
-                self.is_dirty.then_some(Message::Save)
+                icon('\u{F115}'),
+                "Open file",
+                (!self.is_loading).then_some(Message::OpenFile)
             ),
-            horizontal_space(Length::Fill),
+            action(
+                icon('\u{E801}'),
+                "Save file",
+                self.is_dirty.then_some(Message::SaveFile)
+            ),
+            horizontal_space(),
             pick_list(
                 highlighter::Theme::ALL,
                 Some(self.theme),
                 Message::ThemeSelected
             )
+            .text_size(14)
+            .padding([5, 10])
+        ]
+        .spacing(10)
+        .align_y(Center);
+
+        let status = row![
+            text(if let Some(path) = &self.file {
+                let path = path.display().to_string();
+
+                if path.len() > 60 {
+                    format!("...{}", &path[path.len() - 40..])
+                } else {
+                    path
+                }
+            } else if let Some(Error::IOError(error)) = self.error.as_ref() {
+                error.to_string()
+            } else {
+                String::from("New File")
+            }),
+            horizontal_space(),
+            text({
+                let (line, column) = self.content.cursor_position();
+                format!("{}:{}", line + 1, column + 1)
+            })
         ]
         .spacing(10);
 
-        let input = text_editor(&self.content)
-            .on_edit(Message::Edit)
-            .highlight::<Highlighter>(
-                highlighter::Settings {
-                    theme: self.theme,
-                    extension: self
-                        .path
-                        .as_ref()
-                        .and_then(|path| path.extension()?.to_str())
-                        .unwrap_or("txt")
-                        .to_string(),
-                },
-                |highlight, _theme| highlight.to_format(),
-            );
-
-        let status_bar = {
-            let status = if let Some(Error::IOFailed(error)) = self.error.as_ref() {
-                text(error.to_string())
-            } else {
-                match self.path.as_deref().and_then(Path::to_str) {
-                    Some(path) => text(path).size(14),
-                    None => text("New file"),
-                }
-            };
-
-            let position = {
-                let (line, column) = self.content.cursor_position();
-                text(format!("{}:{}", line + 1, column + 1))
-            };
-
-            row![status, horizontal_space(Length::Fill), position]
-        };
-
-        container(column![controls, input, status_bar].spacing(10))
-            .padding(10)
-            .into()
+        column![
+            controls,
+            text_editor(&self.content)
+                .height(Fill)
+                .on_action(Message::ActionPerformed)
+                .highlight::<Highlighter>(
+                    highlighter::Settings {
+                        theme: self.theme,
+                        token: self
+                            .file
+                            .as_deref()
+                            .and_then(Path::extension)
+                            .and_then(ffi::OsStr::to_str)
+                            .map(str::to_string)
+                            .unwrap_or(String::from("txt")),
+                    },
+                    |highlight, _theme| highlight.to_format(),
+                ),
+            status
+        ]
+        .spacing(10)
+        .padding(10)
+        .into()
     }
 
     fn theme(&self) -> Theme {
@@ -182,91 +208,74 @@ impl Application for Editor {
     }
 }
 
-fn new_icon<'a>() -> Element<'a, Message> {
-    icon('\u{E800}')
+#[derive(Debug, Clone)]
+enum Error {
+    DialogClosed,
+    IOError(io::ErrorKind),
 }
 
-fn save_icon<'a>() -> Element<'a, Message> {
-    icon('\u{E801}')
-}
-
-fn open_icon<'a>() -> Element<'a, Message> {
-    icon('\u{F115}')
-}
-
-fn icon<'a>(codepoint: char) -> Element<'a, Message> {
-    const ICON_FONT: Font = Font::with_name("editor-icons");
-
-    text(codepoint).font(ICON_FONT).into()
-}
-
-fn action<'a>(
-    content: Element<'a, Message>,
-    label: &str,
-    on_press: Option<Message>,
-) -> Element<'a, Message> {
-    let is_disabled = on_press.is_none();
-    tooltip(
-        button(container(content).width(30).center_x())
-            .on_press_maybe(on_press)
-            .padding([5, 10])
-            .style(if is_disabled {
-                theme::Button::Secondary
-            } else {
-                theme::Button::Primary
-            }),
-        label,
-        tooltip::Position::FollowCursor,
-    )
-    .style(theme::Container::Box)
-    .into()
-}
-
-fn default_file() -> PathBuf {
-    PathBuf::from(format!("{}\\src\\main.rs", env!("CARGO_MANIFEST_DIR")))
-}
-
-async fn pick_file() -> Result<(PathBuf, Arc<String>), Error> {
-    let handle: rfd::FileHandle = rfd::AsyncFileDialog::new()
-        .set_title("Choose a text file...")
+async fn open_file() -> Result<(PathBuf, Arc<String>), Error> {
+    let picked_file = rfd::AsyncFileDialog::new()
+        .set_title("Open a text file...")
         .pick_file()
         .await
         .ok_or(Error::DialogClosed)?;
-
-    load_file(handle.path().to_owned()).await
+    load_file(picked_file).await
 }
 
-async fn save_file(path: Option<PathBuf>, text: String) -> Result<PathBuf, Error> {
-    let path = if let Some(path) = path {
-        path
-    } else {
-        rfd::AsyncFileDialog::new()
-            .set_title("Choose a file name...")
-            .save_file()
-            .await
-            .ok_or(Error::DialogClosed)
-            .map(|handle| handle.path().to_owned())?
-    };
+async fn load_file(path: impl Into<PathBuf>) -> Result<(PathBuf, Arc<String>), Error> {
+    let path = path.into();
 
-    tokio::fs::write(&path, text)
-        .await
-        .map_err(|error| Error::IOFailed(error.kind()))?;
-
-    Ok(path)
-}
-
-async fn load_file(path: PathBuf) -> Result<(PathBuf, Arc<String>), Error> {
     let contents = tokio::fs::read_to_string(&path)
         .await
         .map(Arc::new)
-        .map_err(|error| error.kind())
-        .map_err(Error::IOFailed)?;
+        .map_err(|error| Error::IOError(error.kind()))?;
 
     Ok((path, contents))
 }
 
-#[derive(Debug, Clone)]
-enum Error {
-    DialogClosed,
-    IOFailed(io::ErrorKind),
+async fn save_file(path: Option<PathBuf>, contents: String) -> Result<PathBuf, Error> {
+    let path = if let Some(path) = path {
+        path
+    } else {
+        rfd::AsyncFileDialog::new()
+            .save_file()
+            .await
+            .as_ref()
+            .map(rfd::FileHandle::path)
+            .map(Path::to_owned)
+            .ok_or(Error::DialogClosed)?
+    };
+
+    tokio::fs::write(&path, contents)
+        .await
+        .map_err(|error| Error::IOError(error.kind()))?;
+
+    Ok(path)
+}
+
+fn action<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: &'a str,
+    on_press: Option<Message>,
+) -> Element<'a, Message> {
+    let action = button(container(content).center_x(30));
+
+    if let Some(on_press) = on_press {
+        tooltip(
+            action.on_press(on_press),
+            label,
+            tooltip::Position::FollowCursor,
+        )
+        .style(container::rounded_box)
+        .into()
+    } else {
+        action.style(button::secondary).into()
+    }
+}
+
+fn icon<'a, Message>(codepoint: char) -> Element<'a, Message> {
+    const ICON_FONT: Font = Font::with_name("editor-icons");
+
+    text(codepoint).font(ICON_FONT).into()
 }
